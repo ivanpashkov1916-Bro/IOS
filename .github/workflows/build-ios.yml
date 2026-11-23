@@ -1,0 +1,247 @@
+name: Build iOS (IPA)
+
+# Сборка iOS-версии PASHKOV PLANER на macOS-раннере GitHub.
+# Папка ios/ в репозитории НЕ хранится (как и android/) — генерируется
+# заново через flutter create и патчится здесь же, ручных правок не нужно.
+#
+# ДВА РЕЖИМА УСТАНОВКИ РЕЗУЛЬТАТА:
+# 1) Без секретов: собирается НЕПОДПИСАННЫЙ PASHKOV-PLANER-unsigned.ipa.
+#    Ставится на iPhone через AltStore / SideStore / Sideloadly с обычным
+#    (бесплатным) Apple ID. Ограничение бесплатного Apple ID: приложение
+#    переподписывается раз в 7 дней (AltStore делает это сам по Wi-Fi).
+# 2) С платным Apple Developer: добавьте секреты репозитория
+#    (Settings → Secrets and variables → Actions):
+#      IOS_TEAM_ID                — Team ID из developer.apple.com (10 символов)
+#      IOS_P12_BASE64             — development-сертификат в .p12, base64
+#      IOS_P12_PASSWORD           — пароль от .p12
+#      IOS_MOBILEPROVISION_BASE64 — development-профиль (UDID iPhone должен
+#                                   быть добавлен в профиль), base64
+#    Тогда собирается ПОДПИСАННЫЙ PASHKOV-PLANER.ipa, который ставится
+#    напрямую (Apple Configurator / AltStore / TestFlight-стиль).
+#    Если подпись падает — сборка автоматически откатывается на
+#    неподписанный вариант (предупреждение в логе), артефакт всё равно будет.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      # Секреты подписи (могут отсутствовать — тогда неподписанная сборка).
+      # НЕ печатать и НЕ выводить эти значения в лог!
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+      IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+      IOS_MOBILEPROVISION_BASE64: ${{ secrets.IOS_MOBILEPROVISION_BASE64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Toolchain check
+        run: |
+          echo '=== WORKFLOW VERSION: ios-v1 (Flutter 3.24.5, no-codesign + optional signing) ==='
+          xcodebuild -version
+          flutter --version
+          pod --version || sudo gem install cocoapods
+          pod --version
+
+      - name: Precache iOS artifacts
+        run: flutter precache --ios
+
+      # Как и в Android-воркфлоу: свежая платформенная папка каждый раз,
+      # чтобы не тащить за собой устаревшие шаблоны.
+      - name: Generate fresh ios/ folder
+        run: |
+          rm -rf ios
+          flutter create --platforms ios --project-name planner_app .
+          test -f ios/Runner/Info.plist \
+            && echo 'OK: ios/ сгенерирована' \
+            || { echo 'FATAL: flutter create не создал ios/!'; exit 1; }
+
+      # Разрешения: без этих ключей iOS молча убивает приложение
+      # при первом обращении к микрофону/камере/галерее.
+      - name: Patch Info.plist (permissions + display name)
+        run: |
+          PLIST=ios/Runner/Info.plist
+          addkey() {
+            /usr/libexec/PlistBuddy -c "Add :$1 string $2" "$PLIST" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Set :$1 $2" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST" > /dev/null \
+              || { echo "FATAL: не удалось записать ключ $1 в Info.plist!"; exit 1; }
+            echo "OK: $1"
+          }
+          addkey CFBundleDisplayName 'PASHKOV PLANER'
+          addkey NSMicrophoneUsageDescription 'Микрофон нужен для голосовых команд ассистенту. Записи не сохраняются.'
+          addkey NSSpeechRecognitionUsageDescription 'Распознавание речи используется для голосовых команд.'
+          addkey NSCameraUsageDescription 'Камера нужна для фото-подтверждений шагов целей.'
+          addkey NSPhotoLibraryUsageDescription 'Доступ к галерее нужен для выбора фото-подтверждений.'
+          addkey NSPhotoLibraryAddUsageDescription 'Сохранение фото-подтверждений в галерею.'
+
+      # Bundle ID: com.pashkov.planner (только таргет Runner, не RunnerTests).
+      - name: Patch bundle identifier
+        run: |
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' '/RunnerTests/! s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = com.pashkov.planner;/g' "$PBX"
+          N=$(grep -c 'PRODUCT_BUNDLE_IDENTIFIER = com.pashkov.planner;' "$PBX")
+          echo "Строк с новым bundle id: $N"
+          [ "$N" -ge 1 ] \
+            && echo 'OK: bundle id com.pashkov.planner' \
+            || { echo 'FATAL: не удалось пропатчить bundle id!'; exit 1; }
+
+      # Подпись — ТОЛЬКО если заданы секреты. Без них шаг пропускается.
+      - name: Install signing assets (если есть секреты)
+        if: env.IOS_P12_BASE64 != ''
+        run: |
+          set -e
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+          KEYCHAIN_PASS="$(openssl rand -base64 16)"
+          security create-keychain -p "$KEYCHAIN_PASS" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASS" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          echo "$IOS_P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k build.keychain -P "$IOS_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" build.keychain > /dev/null
+          security list-keychains -d user -s build.keychain \
+            $(security list-keychains -d user | tr -d '"')
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$IOS_MOBILEPROVISION_BASE64" | base64 --decode > /tmp/profile.mobileprovision
+          cp /tmp/profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          security cms -D -i /tmp/profile.mobileprovision > /tmp/profile.plist
+          PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' /tmp/profile.plist)"
+          echo "OK: provisioning profile установлен (UUID получен)"
+          # Ручная подпись в проекте (только Runner — строки без RunnerTests)
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBX"
+          sed -i '' '/RunnerTests/! s/DEVELOPMENT_TEAM = [^;]*;/DEVELOPMENT_TEAM = '"$IOS_TEAM_ID"';/g' "$PBX"
+          awk -v uuid="$PROFILE_UUID" '{
+            print
+            if ($0 ~ /PRODUCT_BUNDLE_IDENTIFIER = com\.pashkov\.planner;/) {
+              match($0, /^[ \t]*/)
+              indent = substr($0, 1, RLENGTH)
+              print indent "PROVISIONING_PROFILE_SPECIFIER = " uuid ";"
+            }
+          }' "$PBX" > /tmp/pbx && mv /tmp/pbx "$PBX"
+          grep -q "PROVISIONING_PROFILE_SPECIFIER = $PROFILE_UUID;" "$PBX" \
+            && echo 'OK: ручная подпись настроена' \
+            || { echo 'FATAL: не удалось пропатчить подпись в pbxproj!'; exit 1; }
+          # exportOptions для flutter build ipa (development-установка на своё устройство)
+          cat > /tmp/exportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>development</string>
+            <key>teamID</key><string>$IOS_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.pashkov.planner</key><string>$PROFILE_UUID</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+          /usr/libexec/PlistBuddy -c 'Print :method' /tmp/exportOptions.plist > /dev/null \
+            && echo 'OK: exportOptions.plist' \
+            || { echo 'FATAL: exportOptions.plist битый!'; exit 1; }
+
+      # Deployment target: стартуем с 14.0, при ошибке «requires a higher
+      # minimum deployment target» от плагинов (sherpa_onnx/record/fllama)
+      # автоматически поднимаем до 15.0 и 16.0. Если секреты есть, но
+      # подписанная сборка упала НЕ из-за deployment target — откатываемся
+      # на неподписанный IPA (предупреждение в логе).
+      - name: Build IPA (self-healing deployment target 14 → 16)
+        run: |
+          set -o pipefail
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+
+          set_target() {
+            if grep -q '^# *platform :ios' ios/Podfile 2>/dev/null; then
+              sed -i '' "s/^# *platform :ios.*/platform :ios, '$1'/" ios/Podfile
+            elif grep -q '^platform :ios' ios/Podfile 2>/dev/null; then
+              sed -i '' "s/^platform :ios.*/platform :ios, '$1'/" ios/Podfile
+            else
+              { echo "platform :ios, '$1'"; cat ios/Podfile; } > /tmp/Podfile \
+                && mv /tmp/Podfile ios/Podfile
+            fi
+            grep -q "^platform :ios, '$1'" ios/Podfile \
+              && echo "OK: deployment target iOS $1" \
+              || { echo 'FATAL: не удалось пропатчить Podfile!'; cat ios/Podfile; exit 1; }
+          }
+
+          build_unsigned() {
+            flutter build ios --release --no-codesign
+            rm -rf Payload && mkdir -p Payload
+            cp -R build/ios/iphoneos/Runner.app Payload/
+            zip -qry PASHKOV-PLANER-unsigned.ipa Payload
+            echo 'OK: неподписанный IPA собран'
+          }
+
+          build_signed() {
+            flutter build ipa --release --export-options-plist=/tmp/exportOptions.plist
+          }
+
+          attempt() {
+            flutter pub get
+            if [ -n "$IOS_P12_BASE64" ]; then build_signed; else build_unsigned; fi
+          }
+
+          ok=0
+          for T in 14.0 15.0 16.0; do
+            set_target "$T"
+            rm -rf ios/Pods ios/Podfile.lock
+            if attempt 2>&1 | tee /tmp/ios_build.log; then ok=1; break; fi
+            if grep -qiE 'deployment target|higher minimum' /tmp/ios_build.log; then
+              echo "Плагины требуют iOS выше $T — поднимаю deployment target..."
+              continue
+            fi
+            if [ -n "$IOS_P12_BASE64" ]; then
+              echo '::warning::Подписанная сборка не удалась — собираю неподписанный IPA'
+              IOS_P12_BASE64=''
+              continue
+            fi
+            echo 'FATAL: сборка iOS не удалась (причина не в deployment target)'
+            exit 1
+          done
+          [ "$ok" = 1 ] \
+            || { echo 'FATAL: сборка не удалась ни на одном deployment target!'; exit 1; }
+
+          if [ -n "$IOS_P12_BASE64" ]; then
+            ls build/ios/ipa/*.ipa
+            cp build/ios/ipa/*.ipa PASHKOV-PLANER.ipa
+            echo 'OK: подписанный IPA собран'
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pashkov-planer-ios
+          path: |
+            PASHKOV-PLANER.ipa
+            PASHKOV-PLANER-unsigned.ipa
+
+      - name: Summary
+        run: |
+          {
+            echo '## Сборка iOS завершена'
+            echo
+            if [ -f PASHKOV-PLANER.ipa ]; then
+              echo '**PASHKOV-PLANER.ipa** — подписанный, ставится напрямую (Apple Configurator / Sideloadly).'
+            else
+              echo '**PASHKOV-PLANER-unsigned.ipa** — неподписанный.'
+              echo 'Установка: AltStore / SideStore / Sideloadly с бесплатным Apple ID'
+              echo '(переподпись раз в 7 дней, AltStore делает это сам).'
+              echo 'Для постоянной установки добавьте секреты подписи — см. шапку build-ios.yml.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
